@@ -688,11 +688,24 @@ class TrajCrafter:
         
         # Enable xformers memory efficient attention if available
         try:
-            import xformers
-            self.pipeline.enable_xformers_memory_efficient_attention()
-            print("Enabled xformers memory efficient attention")
-        except (ImportError, ModuleNotFoundError):
-            print("xformers not available, using default attention mechanism")
+            # Suppress FutureWarning from xformers
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=FutureWarning)
+                
+                import xformers
+                # Check if xformers version is compatible
+                xformers_version = getattr(xformers, "__version__", "0.0.0")
+                
+                # Only enable xformers for compatible versions
+                if xformers_version >= "0.0.20":
+                    self.pipeline.enable_xformers_memory_efficient_attention()
+                    print(f"Enabled xformers memory efficient attention (version {xformers_version})")
+                else:
+                    print(f"Xformers version {xformers_version} may not be fully compatible, using default attention")
+        except Exception as e:
+            print(f"Could not enable xformers: {e}")
+            print("Using default attention mechanism")
         
         # Clear memory after setup
         gc.collect()

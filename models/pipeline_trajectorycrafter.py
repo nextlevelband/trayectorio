@@ -15,6 +15,8 @@
 
 import inspect
 import math
+import gc
+import numpy as np
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -202,10 +204,10 @@ class TrajCrafter_Pipeline(DiffusionPipeline):
         "negative_prompt_embeds",
     ]
     
-    # Add memory optimization flags
-    _memory_efficient_attention = False
-    _attention_slice_size = None
-    _vae_slicing_enabled = False
+    # Add memory optimization flags - optimized for RTX 4070 Ti Super
+    _memory_efficient_attention = True
+    _attention_slice_size = 4  # Process attention in smaller slices
+    _vae_slicing_enabled = True  # Enable VAE slicing by default
     _tiled_processing_enabled = False
 
     def __init__(

@@ -2,12 +2,25 @@ import gc
 import os
 import numpy as np
 import torch
+import warnings
+
+# Suppress FutureWarning from xformers
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 from diffusers.training_utils import set_seed
 # from models.depth_crafter_ppl import DepthCrafterPipeline
 # from models.unet import DiffusersUNetSpatioTemporalConditionModelDepthCrafter
-from DepthCrafter.depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
-from DepthCrafter.depthcrafter.unet import DiffusersUNetSpatioTemporalConditionModelDepthCrafter
+
+# Try to use our patched UNet model first
+try:
+    from models.unet_patch import DiffusersUNetSpatioTemporalConditionModelDepthCrafter
+    print("Using patched UNet model with device_map support")
+    from DepthCrafter.depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
+except ImportError:
+    # Fallback to original implementation
+    print("Using original DepthCrafter implementation")
+    from DepthCrafter.depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
+    from DepthCrafter.depthcrafter.unet import DiffusersUNetSpatioTemporalConditionModelDepthCrafter
 
 class DepthCrafterDemo:
     def __init__(
@@ -32,25 +45,55 @@ class DepthCrafterDemo:
         total_mem = torch.cuda.get_device_properties(0).total_memory
         available_mem = total_mem - 2 * 1024 * 1024 * 1024  # Reserve 2GB
         
-        # Configure memory allocation
-        max_memory = {
-            "0": "8GiB",  # Allocate 8GB to GPU
-            "cpu": "16GiB"  # Use CPU memory as needed
-        }
-        
-        # Load UNet with optimizations
-        unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
-            unet_path,
-            low_cpu_mem_usage=True,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            max_memory=max_memory,
-        )
+        # Load UNet with optimizations - avoid device_map="auto" since it's not supported
+        try:
+            # First try with basic optimizations but without device_map
+            unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
+                unet_path,
+                low_cpu_mem_usage=True,
+                torch_dtype=torch.float16,
+            )
+            
+            # Move to appropriate device after loading
+            if cpu_offload == "full":
+                unet = unet.to("cpu")
+            else:
+                unet = unet.to(device)
+                
+            # Enable memory optimizations
+            if hasattr(unet, "enable_gradient_checkpointing"):
+                unet.enable_gradient_checkpointing()
+                
+        except Exception as e:
+            print(f"Error loading UNet with optimizations: {e}")
+            print("Falling back to basic loading...")
+            
+            # Fallback to basic loading
+            unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
+                unet_path,
+                torch_dtype=torch.float16,
+            ).to(device)
         
         # Enable gradient checkpointing for UNet if available
         if hasattr(unet, "enable_gradient_checkpointing"):
             unet.enable_gradient_checkpointing()
         
+        # Estimate max memory allocation for RTX 4070 Ti Super
+        if torch.cuda.is_available():
+            total_mem = torch.cuda.get_device_properties(0).total_memory
+            # Reserve 2GB for system
+            available_mem = total_mem - 2 * 1024 * 1024 * 1024
+            gpu_mem = min(available_mem, 12 * 1024 * 1024 * 1024)  # Cap at 12GB
+            
+            # Set memory allocation
+            max_memory = {
+                "0": f"{gpu_mem // (1024 * 1024 * 1024)}GiB",  # Convert to GB
+                "cpu": "16GiB"  # Use CPU memory as needed
+            }
+            print(f"Auto-configured memory allocation: {max_memory}")
+        else:
+            max_memory = None
+            
         # Load pipeline with optimizations
         self.pipe = DepthCrafterPipeline.from_pretrained(
             pre_train_path,
