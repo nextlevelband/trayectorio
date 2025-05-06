@@ -38,6 +38,16 @@ os.makedirs(opts.save_dir, exist_ok=True)
 test_tensor = torch.Tensor([0]).cuda()
 opts.device = str(test_tensor.device)
 
+# Apply memory optimizations for RTX 4070 Ti Super
+opts.low_gpu_memory_mode = True
+opts.enable_attention_slicing = True
+opts.enable_vae_slicing = True
+opts.enable_tiled_processing = True
+opts.cpu_offload = 'sequential'
+opts.sample_size = [384, 576]  # Reduced resolution to save memory
+opts.diffusion_inference_steps = 30  # Reduced steps for faster inference
+opts.depth_inference_steps = 3  # Reduced depth steps to save memory
+
 CAMERA_MOTION_MODE = ["Basic Camera Trajectory", "Custom Camera Trajectory"]
 
 

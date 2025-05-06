@@ -1,4 +1,4 @@
-# gradual mode
+# gradual mode with memory optimizations for RTX 4070 Ti Super
 python inference.py \
     --video_path './test/videos/p7.mp4' \
     --stride 2 \
@@ -9,8 +9,14 @@ python inference.py \
     --mask \
     --target_pose 0 -30 0.3 0 0 \
     --traj_txt 'test/trajs/loop2.txt' \
+    --low_gpu_memory_mode True \
+    --enable_attention_slicing True \
+    --enable_vae_slicing True \
+    --enable_tiled_processing True \
+    --cpu_offload 'sequential' \
+    --sample_size 384 576 \
 
-# # direct mode
+# # direct mode with memory optimizations for RTX 4070 Ti Super
 # python inference.py \
 #     --video_path './test/videos/p7.mp4' \
 #     --stride 2 \
@@ -21,8 +27,14 @@ python inference.py \
 #     --mask \
 #     --target_pose 0 -30 0.3 0 0 \
 #     --traj_txt 'test/trajs/loop2.txt' \
+#     --low_gpu_memory_mode True \
+#     --enable_attention_slicing True \
+#     --enable_vae_slicing True \
+#     --enable_tiled_processing True \
+#     --cpu_offload 'sequential' \
+#     --sample_size 384 576 \
 
-# # bullet time
+# # bullet time with memory optimizations for RTX 4070 Ti Super
 # python inference.py \
 #     --video_path './test/videos/p7.mp4' \
 #     --stride 2 \
@@ -33,8 +45,14 @@ python inference.py \
 #     --mask \
 #     --target_pose 0 -30 0.3 0 0 \
 #     --traj_txt 'test/trajs/loop2.txt' \
+#     --low_gpu_memory_mode True \
+#     --enable_attention_slicing True \
+#     --enable_vae_slicing True \
+#     --enable_tiled_processing True \
+#     --cpu_offload 'sequential' \
+#     --sample_size 384 576 \
 
-# # dolly-zoom mode
+# # dolly-zoom mode with memory optimizations for RTX 4070 Ti Super
 # python inference.py \
 #     --video_path './test/videos/p7.mp4' \
 #     --stride 2 \
@@ -45,3 +63,9 @@ python inference.py \
 #     --mask \
 #     --target_pose 0 0 0.5 0 0 \
 #     --traj_txt 'test/trajs/loop2.txt' \
+#     --low_gpu_memory_mode True \
+#     --enable_attention_slicing True \
+#     --enable_vae_slicing True \
+#     --enable_tiled_processing True \
+#     --cpu_offload 'sequential' \
+#     --sample_size 384 576 \

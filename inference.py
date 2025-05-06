@@ -71,8 +71,38 @@ def get_parser():
     parser.add_argument(
         '--low_gpu_memory_mode',
         type=bool,
-        default=False,
+        default=True,
         help='Enable low GPU memory mode',
+    )
+    parser.add_argument(
+        '--enable_attention_slicing',
+        type=bool,
+        default=True,
+        help='Enable attention slicing for memory efficiency',
+    )
+    parser.add_argument(
+        '--enable_vae_slicing',
+        type=bool,
+        default=True,
+        help='Enable VAE slicing for memory efficiency',
+    )
+    parser.add_argument(
+        '--enable_tiled_processing',
+        type=bool,
+        default=True,
+        help='Enable tiled processing for large images',
+    )
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=1,
+        help='Batch size for processing',
+    )
+    parser.add_argument(
+        '--max_memory',
+        type=dict,
+        default=None,
+        help='Maximum memory allocation for model components',
     )
     # parser.add_argument('--model_name', type=str, default='checkpoints/CogVideoX-Fun-V1.1-5b-InP', help='Path to the model')
     parser.add_argument(
