@@ -45,21 +45,52 @@ class DepthCrafterDemo:
         total_mem = torch.cuda.get_device_properties(0).total_memory
         available_mem = total_mem - 2 * 1024 * 1024 * 1024  # Reserve 2GB
         
-        # Load UNet with optimizations - avoid device_map="auto" since it's not supported
+        # Load UNet with optimizations using our patched model with device_map support
         try:
-            # First try with basic optimizations but without device_map
-            unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
-                unet_path,
-                low_cpu_mem_usage=True,
-                torch_dtype=torch.float16,
-            )
-            
-            # Move to appropriate device after loading
-            if cpu_offload == "full":
-                unet = unet.to("cpu")
-            else:
-                unet = unet.to(device)
+            # Estimate max memory allocation for RTX 4070 Ti Super
+            if torch.cuda.is_available():
+                total_mem = torch.cuda.get_device_properties(0).total_memory
+                # Reserve 2GB for system
+                available_mem = total_mem - 2 * 1024 * 1024 * 1024
+                gpu_mem = min(available_mem, 12 * 1024 * 1024 * 1024)  # Cap at 12GB
                 
+                # Set memory allocation
+                max_memory = {
+                    "0": f"{gpu_mem // (1024 * 1024 * 1024)}GiB",  # Convert to GB
+                    "cpu": "16GiB"  # Use CPU memory as needed
+                }
+                print(f"Auto-configured memory allocation: {max_memory}")
+            else:
+                max_memory = None
+            
+            # Check if we're using the patched model by checking its module path
+            module_path = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.__module__
+            using_patched_model = 'unet_patch' in module_path
+            
+            if using_patched_model:
+                print(f"Using patched UNet with device_map support from {module_path}")
+                unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
+                    unet_path,
+                    low_cpu_mem_usage=True,
+                    torch_dtype=torch.float16,
+                    device_map="auto" if cpu_offload == "sequential" else None,
+                    max_memory=max_memory if cpu_offload == "sequential" else None,
+                )
+            else:
+                # If we're using the original model, don't use device_map
+                print(f"Using original UNet without device_map support from {module_path}")
+                unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
+                    unet_path,
+                    low_cpu_mem_usage=True,
+                    torch_dtype=torch.float16,
+                )
+                
+                # Move to appropriate device after loading
+                if cpu_offload == "full":
+                    unet = unet.to("cpu")
+                else:
+                    unet = unet.to(device)
+            
             # Enable memory optimizations
             if hasattr(unet, "enable_gradient_checkpointing"):
                 unet.enable_gradient_checkpointing()
@@ -68,7 +99,7 @@ class DepthCrafterDemo:
             print(f"Error loading UNet with optimizations: {e}")
             print("Falling back to basic loading...")
             
-            # Fallback to basic loading
+            # Fallback to basic loading without device_map
             unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
                 unet_path,
                 torch_dtype=torch.float16,
@@ -78,21 +109,7 @@ class DepthCrafterDemo:
         if hasattr(unet, "enable_gradient_checkpointing"):
             unet.enable_gradient_checkpointing()
         
-        # Estimate max memory allocation for RTX 4070 Ti Super
-        if torch.cuda.is_available():
-            total_mem = torch.cuda.get_device_properties(0).total_memory
-            # Reserve 2GB for system
-            available_mem = total_mem - 2 * 1024 * 1024 * 1024
-            gpu_mem = min(available_mem, 12 * 1024 * 1024 * 1024)  # Cap at 12GB
-            
-            # Set memory allocation
-            max_memory = {
-                "0": f"{gpu_mem // (1024 * 1024 * 1024)}GiB",  # Convert to GB
-                "cpu": "16GiB"  # Use CPU memory as needed
-            }
-            print(f"Auto-configured memory allocation: {max_memory}")
-        else:
-            max_memory = None
+        # Memory allocation is now handled in the UNet loading section
             
         # Load pipeline with optimizations
         self.pipe = DepthCrafterPipeline.from_pretrained(
