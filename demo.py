@@ -597,17 +597,55 @@ class TrajCrafter:
         return pose_s, pose_t, K
 
     def setup_diffusion(self, opts):
-        # transformer = CrossTransformer3DModel.from_pretrained_cus(opts.transformer_path).to(opts.weight_dtype)
-        transformer = CrossTransformer3DModel.from_pretrained(opts.transformer_path).to(
-            opts.weight_dtype
+        # Memory optimization: Use torch.cuda.empty_cache() to clear GPU memory before loading models
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Set maximum memory usage for model components if not specified
+        if opts.max_memory is None:
+            # Allocate memory based on available VRAM - reserve 2GB for other operations
+            total_mem = torch.cuda.get_device_properties(0).total_memory
+            available_mem = total_mem - 2 * 1024 * 1024 * 1024  # Reserve 2GB
+            
+            # Distribute memory among components
+            opts.max_memory = {
+                "0": "8GiB",  # Allocate 8GB to GPU
+                "cpu": "16GiB"  # Use CPU memory as needed
+            }
+        
+        # Load transformer with optimizations
+        transformer = CrossTransformer3DModel.from_pretrained(
+            opts.transformer_path,
+            torch_dtype=opts.weight_dtype,
+            low_cpu_mem_usage=True,
+            device_map="auto" if opts.low_gpu_memory_mode else None,
+            max_memory=opts.max_memory if opts.low_gpu_memory_mode else None
         )
-        # transformer = transformer.to(opts.weight_dtype)
+        
+        # Enable gradient checkpointing for transformer to save memory
+        if hasattr(transformer, "enable_gradient_checkpointing"):
+            transformer.enable_gradient_checkpointing()
+        
+        # Load VAE with optimizations
         vae = AutoencoderKLCogVideoX.from_pretrained(
-            opts.model_name, subfolder="vae"
-        ).to(opts.weight_dtype)
-        text_encoder = T5EncoderModel.from_pretrained(
-            opts.model_name, subfolder="text_encoder", torch_dtype=opts.weight_dtype
+            opts.model_name, 
+            subfolder="vae",
+            torch_dtype=opts.weight_dtype,
+            low_cpu_mem_usage=True,
+            device_map="auto" if opts.low_gpu_memory_mode else None,
+            max_memory=opts.max_memory if opts.low_gpu_memory_mode else None
         )
+        
+        # Load text encoder with optimizations
+        text_encoder = T5EncoderModel.from_pretrained(
+            opts.model_name, 
+            subfolder="text_encoder", 
+            torch_dtype=opts.weight_dtype,
+            low_cpu_mem_usage=True,
+            device_map="auto" if opts.low_gpu_memory_mode else None,
+            max_memory=opts.max_memory if opts.low_gpu_memory_mode else None
+        )
+        
         # Get Scheduler
         Choosen_Scheduler = {
             "Euler": EulerDiscreteScheduler,
@@ -621,6 +659,7 @@ class TrajCrafter:
             opts.model_name, subfolder="scheduler"
         )
 
+        # Create pipeline with optimizations
         self.pipeline = TrajCrafter_Pipeline.from_pretrained(
             opts.model_name,
             vae=vae,
@@ -628,12 +667,49 @@ class TrajCrafter:
             transformer=transformer,
             scheduler=scheduler,
             torch_dtype=opts.weight_dtype,
+            device_map="auto" if opts.low_gpu_memory_mode else None,
+            max_memory=opts.max_memory if opts.low_gpu_memory_mode else None,
+            low_cpu_mem_usage=True,
         )
-
+        
+        # Apply memory optimization techniques
         if opts.low_gpu_memory_mode:
             self.pipeline.enable_sequential_cpu_offload()
         else:
             self.pipeline.enable_model_cpu_offload()
+        
+        # Enable additional memory optimizations
+        if opts.enable_attention_slicing:
+            self.pipeline.enable_attention_slicing(slice_size="auto")
+        
+        if opts.enable_vae_slicing:
+            if hasattr(self.pipeline, "enable_vae_slicing"):
+                self.pipeline.enable_vae_slicing()
+        
+        # Enable xformers memory efficient attention if available
+        try:
+            # Suppress FutureWarning from xformers
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=FutureWarning)
+                
+                import xformers
+                # Check if xformers version is compatible
+                xformers_version = getattr(xformers, "__version__", "0.0.0")
+                
+                # Only enable xformers for compatible versions
+                if xformers_version >= "0.0.20":
+                    self.pipeline.enable_xformers_memory_efficient_attention()
+                    print(f"Enabled xformers memory efficient attention (version {xformers_version})")
+                else:
+                    print(f"Xformers version {xformers_version} may not be fully compatible, using default attention")
+        except Exception as e:
+            print(f"Could not enable xformers: {e}")
+            print("Using default attention mechanism")
+        
+        # Clear memory after setup
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def run_gradio(self, input_video, stride, radius_scale, pose, steps, seed):
         frames = read_video_frames(

@@ -71,8 +71,38 @@ def get_parser():
     parser.add_argument(
         '--low_gpu_memory_mode',
         type=bool,
-        default=False,
+        default=True,
         help='Enable low GPU memory mode',
+    )
+    parser.add_argument(
+        '--enable_attention_slicing',
+        type=bool,
+        default=True,
+        help='Enable attention slicing for memory efficiency',
+    )
+    parser.add_argument(
+        '--enable_vae_slicing',
+        type=bool,
+        default=True,
+        help='Enable VAE slicing for memory efficiency',
+    )
+    parser.add_argument(
+        '--enable_tiled_processing',
+        type=bool,
+        default=True,
+        help='Enable tiled processing for large images',
+    )
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=1,
+        help='Batch size for processing',
+    )
+    parser.add_argument(
+        '--max_memory',
+        type=dict,
+        default=None,
+        help='Maximum memory allocation for model components',
     )
     # parser.add_argument('--model_name', type=str, default='checkpoints/CogVideoX-Fun-V1.1-5b-InP', help='Path to the model')
     parser.add_argument(
@@ -99,7 +129,7 @@ def get_parser():
         '--sample_size',
         type=int,
         nargs=2,
-        default=[384, 672],
+        default=[384, 576],  # Reduced default resolution to save memory for RTX 4070 Ti Super
         help='Sample size as [height, width]',
     )
     parser.add_argument(
@@ -111,7 +141,7 @@ def get_parser():
     parser.add_argument(
         '--diffusion_inference_steps',
         type=int,
-        default=50,
+        default=25,  # Reduced default steps to save memory for RTX 4070 Ti Super
         help='Number of inference steps',
     )
     parser.add_argument(
@@ -148,7 +178,19 @@ def get_parser():
         help='Path to the pre-trained model',
     )
     parser.add_argument(
-        '--cpu_offload', type=str, default='model', help='CPU offload strategy'
+        '--cpu_offload', type=str, default='sequential', help='CPU offload strategy: "sequential", "model", or "full"'
+    )
+    parser.add_argument(
+        '--low_gpu_memory_mode', action='store_true', default=True, 
+        help='Enable low GPU memory mode with aggressive optimizations'
+    )
+    parser.add_argument(
+        '--enable_attention_slicing', action='store_true', default=True,
+        help='Enable attention slicing to reduce memory usage'
+    )
+    parser.add_argument(
+        '--enable_vae_slicing', action='store_true', default=True,
+        help='Enable VAE slicing to reduce memory usage during encoding/decoding'
     )
     parser.add_argument(
         '--depth_inference_steps', type=int, default=5, help='Number of inference steps'
@@ -175,7 +217,30 @@ def get_parser():
 if __name__ == "__main__":
     parser = get_parser()  # infer config.py
     opts = parser.parse_args()
-    opts.weight_dtype = torch.bfloat16
+    
+    # Set weight dtype based on available hardware
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+        # Use bfloat16 for Ampere (RTX 30xx) or newer GPUs
+        opts.weight_dtype = torch.bfloat16
+    else:
+        # Use float16 for older GPUs
+        opts.weight_dtype = torch.float16
+    
+    # Configure memory allocation for RTX 4070 Ti Super
+    if opts.max_memory is None:
+        # Estimate available memory and reserve some for system
+        if torch.cuda.is_available():
+            total_mem = torch.cuda.get_device_properties(0).total_memory
+            # RTX 4070 Ti Super has ~16GB VRAM, reserve 2GB for system
+            available_mem = total_mem - 2 * 1024 * 1024 * 1024
+            gpu_mem = min(available_mem, 12 * 1024 * 1024 * 1024)  # Cap at 12GB
+            
+            # Set memory allocation
+            opts.max_memory = {
+                "0": f"{gpu_mem // (1024 * 1024 * 1024)}GiB",  # Convert to GB
+                "cpu": "16GiB"  # Use CPU memory as needed
+            }
+            print(f"Auto-configured memory allocation: {opts.max_memory}")
     if opts.exp_name == None:
         prefix = datetime.now().strftime("%Y%m%d_%H%M")
         opts.exp_name = (

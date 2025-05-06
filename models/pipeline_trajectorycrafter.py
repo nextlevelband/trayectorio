@@ -15,6 +15,8 @@
 
 import inspect
 import math
+import gc
+import numpy as np
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -193,6 +195,7 @@ class CogVideoX_Fun_PipelineOutput(BaseOutput):
 class TrajCrafter_Pipeline(DiffusionPipeline):
 
     _optional_components = []
+    # Optimize CPU offload sequence for better memory management
     model_cpu_offload_seq = "text_encoder->transformer->vae"
 
     _callback_tensor_inputs = [
@@ -200,6 +203,12 @@ class TrajCrafter_Pipeline(DiffusionPipeline):
         "prompt_embeds",
         "negative_prompt_embeds",
     ]
+    
+    # Add memory optimization flags - optimized for RTX 4070 Ti Super
+    _memory_efficient_attention = True
+    _attention_slice_size = 4  # Process attention in smaller slices
+    _vae_slicing_enabled = True  # Enable VAE slicing by default
+    _tiled_processing_enabled = False
 
     def __init__(
         self,
@@ -241,6 +250,70 @@ class TrajCrafter_Pipeline(DiffusionPipeline):
             do_binarize=True,
             do_convert_grayscale=True,
         )
+        
+    def enable_vae_slicing(self):
+        """
+        Enable sliced VAE decoding.
+        When this option is enabled, the VAE will split the input tensor in slices to compute decoding in several
+        steps. This is useful to save some memory and allow larger batch sizes.
+        """
+        self._vae_slicing_enabled = True
+        
+    def disable_vae_slicing(self):
+        """
+        Disable sliced VAE decoding. If `enable_vae_slicing` was previously enabled, this method will go back to
+        computing decoding in one step.
+        """
+        self._vae_slicing_enabled = False
+        
+    def enable_tiled_processing(self):
+        """
+        Enable tiled processing for large images.
+        When this option is enabled, the model will process large images in tiles to save memory.
+        """
+        self._tiled_processing_enabled = True
+        
+    def disable_tiled_processing(self):
+        """
+        Disable tiled processing. If `enable_tiled_processing` was previously enabled, this method will go back to
+        processing the entire image at once.
+        """
+        self._tiled_processing_enabled = False
+        
+    def enable_attention_slicing(self, slice_size: Optional[Union[str, int]] = "auto"):
+        """
+        Enable sliced attention computation.
+        When this option is enabled, the attention module will split the input tensor in slices to compute attention
+        in several steps. This is useful to save some memory in exchange for a small speed decrease.
+        
+        Args:
+            slice_size (`str` or `int`, *optional*, defaults to `"auto"`):
+                When `"auto"`, the size of the slices is determined by the model's configuration. When a number is
+                provided, it defines the size of each slice. Default is `"auto"`.
+        """
+        if slice_size == "auto":
+            # Half the attention head size is usually a good compromise
+            if hasattr(self.transformer.config, "attention_head_dim"):
+                slice_size = self.transformer.config.attention_head_dim // 2
+            else:
+                slice_size = None
+        
+        self._attention_slice_size = slice_size
+        
+        # Set attention slice size for all attention modules
+        if hasattr(self.transformer, "set_attention_slice"):
+            self.transformer.set_attention_slice(slice_size)
+            
+    def disable_attention_slicing(self):
+        """
+        Disable sliced attention computation. If `enable_attention_slicing` was previously enabled, this method will go back to
+        computing attention in one step.
+        """
+        self._attention_slice_size = None
+        
+        # Disable attention slicing for all attention modules
+        if hasattr(self.transformer, "set_attention_slice"):
+            self.transformer.set_attention_slice(None)
 
     def _get_t5_prompt_embeds(
         self,
@@ -394,6 +467,7 @@ class TrajCrafter_Pipeline(DiffusionPipeline):
         return_noise=False,
         return_video_latents=False,
     ):
+        # Calculate latent shape with memory-efficient dimensions
         shape = (
             batch_size,
             (video_length - 1) // self.vae_scale_factor_temporal + 1,
@@ -401,48 +475,141 @@ class TrajCrafter_Pipeline(DiffusionPipeline):
             height // self.vae_scale_factor_spatial,
             width // self.vae_scale_factor_spatial,
         )
+        
+        # Validate generator
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
+        # Process video if needed
         if return_video_latents or (latents is None and not is_strength_max):
+            # Clear memory before processing
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            # Move video to device with appropriate dtype
             video = video.to(device=device, dtype=self.vae.dtype)
 
+            # Process video in smaller batches to save memory
+            # Use smaller batch size for VAE encoding to reduce memory usage
             bs = 1
             new_video = []
+            
+            # Process frames in chunks to reduce memory usage
             for i in range(0, video.shape[0], bs):
+                # Get current batch
                 video_bs = video[i : i + bs]
-                video_bs = self.vae.encode(video_bs)[0]
-                video_bs = video_bs.sample()
+                
+                # Use VAE slicing if enabled
+                if self._vae_slicing_enabled:
+                    # Encode with slicing for memory efficiency
+                    video_bs_latent = None
+                    for slice_idx in range(0, video_bs.shape[2], 1):  # Process 1 frame at a time
+                        # Get current slice
+                        video_slice = video_bs[:, :, slice_idx:slice_idx+1, :, :]
+                        
+                        # Encode slice
+                        slice_latent = self.vae.encode(video_slice)[0].sample()
+                        
+                        # Concatenate with previous slices
+                        if video_bs_latent is None:
+                            video_bs_latent = slice_latent
+                        else:
+                            video_bs_latent = torch.cat([video_bs_latent, slice_latent], dim=2)
+                        
+                        # Clear memory after each slice
+                        torch.cuda.empty_cache()
+                    
+                    video_bs = video_bs_latent
+                else:
+                    # Standard encoding
+                    video_bs = self.vae.encode(video_bs)[0].sample()
+                
+                # Append to results
                 new_video.append(video_bs)
+                
+                # Clear memory after each batch
+                torch.cuda.empty_cache()
+            
+            # Combine results
             video = torch.cat(new_video, dim=0)
             video = video * self.vae.config.scaling_factor
 
+            # Create video latents
             video_latents = video.repeat(batch_size // video.shape[0], 1, 1, 1, 1)
             video_latents = video_latents.to(device=device, dtype=dtype)
             video_latents = rearrange(video_latents, "b c f h w -> b f c h w")
+            
+            # Clear memory after processing
+            del video
+            gc.collect()
+            torch.cuda.empty_cache()
 
         if latents is None:  # this branch
-            noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-            # if strength is 1. then initialise the latents to noise, else initial to image + noise
-            latents = (
-                noise
-                if is_strength_max
-                else self.scheduler.add_noise(video_latents, noise, timestep)
-            )
-            # if pure noise then scale the initial latents by the  Scheduler's init sigma
-            latents = (
-                latents * self.scheduler.init_noise_sigma
-                if is_strength_max
-                else latents
-            )
+            # Generate noise in chunks to save memory for large shapes
+            if shape[0] * shape[1] * shape[2] * shape[3] * shape[4] > 64 * 1024 * 1024:  # If total elements > 64M
+                # Generate noise in chunks
+                noise_chunks = []
+                chunk_size = max(1, shape[1] // 4)  # Split temporal dimension
+                
+                for i in range(0, shape[1], chunk_size):
+                    end_idx = min(i + chunk_size, shape[1])
+                    chunk_shape = (shape[0], end_idx - i, shape[2], shape[3], shape[4])
+                    noise_chunk = randn_tensor(chunk_shape, generator=generator, device=device, dtype=dtype)
+                    noise_chunks.append(noise_chunk)
+                    
+                    # Clear memory after each chunk
+                    torch.cuda.empty_cache()
+                
+                # Combine chunks
+                noise = torch.cat(noise_chunks, dim=1)
+            else:
+                # Generate noise in one go for smaller shapes
+                noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            
+            # If strength is 1, initialize latents to noise, else initialize to image + noise
+            if is_strength_max:
+                latents = noise
+            else:
+                # Add noise in chunks to save memory
+                if video_latents.shape[1] > 16:  # For longer videos
+                    latents_chunks = []
+                    chunk_size = 8  # Process 8 frames at a time
+                    
+                    for i in range(0, video_latents.shape[1], chunk_size):
+                        end_idx = min(i + chunk_size, video_latents.shape[1])
+                        video_chunk = video_latents[:, i:end_idx, :, :, :]
+                        noise_chunk = noise[:, i:end_idx, :, :, :]
+                        
+                        # Add noise to chunk
+                        latents_chunk = self.scheduler.add_noise(video_chunk, noise_chunk, timestep)
+                        latents_chunks.append(latents_chunk)
+                        
+                        # Clear memory after each chunk
+                        del video_chunk, noise_chunk
+                        torch.cuda.empty_cache()
+                    
+                    # Combine chunks
+                    latents = torch.cat(latents_chunks, dim=1)
+                else:
+                    # Process in one go for shorter videos
+                    latents = self.scheduler.add_noise(video_latents, noise, timestep)
+            
+            # Scale latents by scheduler's init sigma if using pure noise
+            if is_strength_max:
+                latents = latents * self.scheduler.init_noise_sigma
         else:
+            # Use provided latents
             noise = latents.to(device)
             latents = noise * self.scheduler.init_noise_sigma
 
-        # scale the initial noise by the standard deviation required by the scheduler
+        # Clear memory
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Prepare outputs
         outputs = (latents,)
 
         if return_noise:
@@ -466,52 +633,200 @@ class TrajCrafter_Pipeline(DiffusionPipeline):
         do_classifier_free_guidance,
         noise_aug_strength,
     ):
-        # resize the mask to latents shape as we concatenate the mask to the latents
-        # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
-        # and half precision
-
+        # Clear memory before processing
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Process mask if provided
         if mask is not None:
+            # Move mask to device with appropriate dtype
             mask = mask.to(device=device, dtype=self.vae.dtype)
+            
+            # Process mask in smaller batches to save memory
             bs = 1
             new_mask = []
+            
+            # Process frames in chunks
             for i in range(0, mask.shape[0], bs):
+                # Get current batch
                 mask_bs = mask[i : i + bs]
-                mask_bs = self.vae.encode(mask_bs)[0]
-                mask_bs = mask_bs.mode()
+                
+                # Use VAE slicing if enabled
+                if self._vae_slicing_enabled and mask_bs.shape[2] > 8:
+                    # Encode with slicing for memory efficiency
+                    mask_bs_latent = None
+                    chunk_size = 4  # Process 4 frames at a time
+                    
+                    for slice_idx in range(0, mask_bs.shape[2], chunk_size):
+                        end_idx = min(slice_idx + chunk_size, mask_bs.shape[2])
+                        # Get current slice
+                        mask_slice = mask_bs[:, :, slice_idx:end_idx, :, :]
+                        
+                        # Encode slice
+                        slice_latent = self.vae.encode(mask_slice)[0]
+                        slice_latent = slice_latent.mode()
+                        
+                        # Concatenate with previous slices
+                        if mask_bs_latent is None:
+                            mask_bs_latent = slice_latent
+                        else:
+                            mask_bs_latent = torch.cat([mask_bs_latent, slice_latent], dim=2)
+                        
+                        # Clear memory after each slice
+                        torch.cuda.empty_cache()
+                    
+                    mask_bs = mask_bs_latent
+                else:
+                    # Standard encoding
+                    mask_bs = self.vae.encode(mask_bs)[0]
+                    mask_bs = mask_bs.mode()
+                
+                # Append to results
                 new_mask.append(mask_bs)
+                
+                # Clear memory after each batch
+                torch.cuda.empty_cache()
+            
+            # Combine results
             mask = torch.cat(new_mask, dim=0)
             mask = mask * self.vae.config.scaling_factor
+            
+            # Clear memory after processing
+            torch.cuda.empty_cache()
 
+        # Process masked image if provided
         if masked_image is not None:
+            # Apply noise if needed
             if self.transformer.config.add_noise_in_inpaint_model:
-                masked_image = add_noise_to_reference_video(
-                    masked_image, ratio=noise_aug_strength
-                )
+                # Add noise in a memory-efficient way
+                if masked_image.shape[0] * masked_image.shape[2] > 32:  # For larger videos
+                    # Process in chunks
+                    chunks = []
+                    chunk_size = 8  # Process 8 frames at a time
+                    
+                    for i in range(0, masked_image.shape[2], chunk_size):
+                        end_idx = min(i + chunk_size, masked_image.shape[2])
+                        chunk = masked_image[:, :, i:end_idx, :, :]
+                        noisy_chunk = add_noise_to_reference_video(chunk, ratio=noise_aug_strength)
+                        chunks.append(noisy_chunk)
+                        torch.cuda.empty_cache()
+                    
+                    masked_image = torch.cat(chunks, dim=2)
+                else:
+                    # Process in one go for smaller videos
+                    masked_image = add_noise_to_reference_video(masked_image, ratio=noise_aug_strength)
+            
+            # Move masked image to device with appropriate dtype
             masked_image = masked_image.to(device=device, dtype=self.vae.dtype)
+            
+            # Process masked image in smaller batches to save memory
             bs = 1
             new_mask_pixel_values = []
+            
+            # Process frames in chunks
             for i in range(0, masked_image.shape[0], bs):
+                # Get current batch
                 mask_pixel_values_bs = masked_image[i : i + bs]
-                mask_pixel_values_bs = self.vae.encode(mask_pixel_values_bs)[0]
-                mask_pixel_values_bs = mask_pixel_values_bs.mode()
+                
+                # Use VAE slicing if enabled
+                if self._vae_slicing_enabled and mask_pixel_values_bs.shape[2] > 8:
+                    # Encode with slicing for memory efficiency
+                    mask_pixel_values_bs_latent = None
+                    chunk_size = 4  # Process 4 frames at a time
+                    
+                    for slice_idx in range(0, mask_pixel_values_bs.shape[2], chunk_size):
+                        end_idx = min(slice_idx + chunk_size, mask_pixel_values_bs.shape[2])
+                        # Get current slice
+                        mask_pixel_values_slice = mask_pixel_values_bs[:, :, slice_idx:end_idx, :, :]
+                        
+                        # Encode slice
+                        slice_latent = self.vae.encode(mask_pixel_values_slice)[0]
+                        slice_latent = slice_latent.mode()
+                        
+                        # Concatenate with previous slices
+                        if mask_pixel_values_bs_latent is None:
+                            mask_pixel_values_bs_latent = slice_latent
+                        else:
+                            mask_pixel_values_bs_latent = torch.cat([mask_pixel_values_bs_latent, slice_latent], dim=2)
+                        
+                        # Clear memory after each slice
+                        torch.cuda.empty_cache()
+                    
+                    mask_pixel_values_bs = mask_pixel_values_bs_latent
+                else:
+                    # Standard encoding
+                    mask_pixel_values_bs = self.vae.encode(mask_pixel_values_bs)[0]
+                    mask_pixel_values_bs = mask_pixel_values_bs.mode()
+                
+                # Append to results
                 new_mask_pixel_values.append(mask_pixel_values_bs)
+                
+                # Clear memory after each batch
+                torch.cuda.empty_cache()
+            
+            # Combine results
             masked_image_latents = torch.cat(new_mask_pixel_values, dim=0)
             masked_image_latents = masked_image_latents * self.vae.config.scaling_factor
+            
+            # Clear memory after processing
+            torch.cuda.empty_cache()
         else:
             masked_image_latents = None
+        
+        # Final memory cleanup
+        gc.collect()
+        torch.cuda.empty_cache()
 
         return mask, masked_image_latents
 
     def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        # Clear memory before decoding
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Permute latents to expected format
         latents = latents.permute(
             0, 2, 1, 3, 4
         )  # [batch_size, num_channels, num_frames, height, width]
+        
+        # Scale latents
         latents = 1 / self.vae.config.scaling_factor * latents
-
-        frames = self.vae.decode(latents).sample
-        frames = (frames / 2 + 0.5).clamp(0, 1)
-        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
-        frames = frames.cpu().float().numpy()
+        
+        # Use VAE slicing for memory-efficient decoding if enabled
+        if self._vae_slicing_enabled and latents.shape[2] > 8:
+            # Decode with slicing for memory efficiency
+            frames_list = []
+            chunk_size = 4  # Process 4 frames at a time
+            
+            for slice_idx in range(0, latents.shape[2], chunk_size):
+                # Get current slice
+                end_idx = min(slice_idx + chunk_size, latents.shape[2])
+                latents_slice = latents[:, :, slice_idx:end_idx, :, :]
+                
+                # Decode slice
+                frames_slice = self.vae.decode(latents_slice).sample
+                frames_slice = (frames_slice / 2 + 0.5).clamp(0, 1)
+                
+                # Move to CPU to save GPU memory
+                frames_slice = frames_slice.cpu().float().numpy()
+                frames_list.append(frames_slice)
+                
+                # Clear memory after each slice
+                torch.cuda.empty_cache()
+            
+            # Combine results
+            frames = np.concatenate(frames_list, axis=2)
+        else:
+            # Standard decoding
+            frames = self.vae.decode(latents).sample
+            frames = (frames / 2 + 0.5).clamp(0, 1)
+            # We always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
+            frames = frames.cpu().float().numpy()
+        
+        # Clear memory after decoding
+        gc.collect()
+        torch.cuda.empty_cache()
+        
         return frames
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
