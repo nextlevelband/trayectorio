@@ -159,7 +159,7 @@ def trajcrafter_demo(opts):
                     step=1,
                     elem_id="i2v_steps",
                     label="Sampling steps",
-                    value=50,
+                    value=30,  # Reduced default steps to save memory for RTX 4070 Ti Super
                 )
                 i2v_seed = gr.Slider(
                     label='Random seed', minimum=0, maximum=max_seed, step=1, value=43

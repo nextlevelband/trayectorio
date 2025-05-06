@@ -15,6 +15,7 @@ python inference.py \
     --enable_tiled_processing True \
     --cpu_offload 'sequential' \
     --sample_size 384 576 \
+    --diffusion_inference_steps 25 \
 
 # # direct mode with memory optimizations for RTX 4070 Ti Super
 # python inference.py \
@@ -33,6 +34,7 @@ python inference.py \
 #     --enable_tiled_processing True \
 #     --cpu_offload 'sequential' \
 #     --sample_size 384 576 \
+#     --diffusion_inference_steps 25 \
 
 # # bullet time with memory optimizations for RTX 4070 Ti Super
 # python inference.py \
@@ -51,6 +53,7 @@ python inference.py \
 #     --enable_tiled_processing True \
 #     --cpu_offload 'sequential' \
 #     --sample_size 384 576 \
+#     --diffusion_inference_steps 25 \
 
 # # dolly-zoom mode with memory optimizations for RTX 4070 Ti Super
 # python inference.py \
@@ -69,3 +72,4 @@ python inference.py \
 #     --enable_tiled_processing True \
 #     --cpu_offload 'sequential' \
 #     --sample_size 384 576 \
+#     --diffusion_inference_steps 25 \
